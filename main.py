@@ -40,7 +40,7 @@ load_dotenv()
 # Set these flags to control debugging behavior
 DEBUG_MODE = False  # Set to True to enable debug logging and prints
 TRACE_MODE = False  # Set to True to enable detailed tracing (stack traces, etc)
-SHOW_VIEW_TOKENS = False  # Set to False to hide the View Tokens button
+SHOW_VIEW_TOKENS = True  # Set to True to allow anyone to view tokens
 
 # Get OAuth2 credentials from environment variables
 OAUTH_CLIENT_ID = os.getenv('OAUTH_CLIENT_ID', 'connect-portal')
@@ -1285,27 +1285,8 @@ async def save_tokens_form(request: Request, access_token: str = Form(...), refr
 
 @app.get("/mytokens", response_class=HTMLResponse)
 async def view_tokens(request: Request):
-    """View tokens for the current authenticated session only."""
+    """View tokens for the current authenticated session."""
     try:
-        # Enhanced security: Check referrer to prevent direct access
-        referrer = request.headers.get("referer", "")
-        if not referrer or not any(domain in referrer for domain in ["localhost:8000", "127.0.0.1:8000"]):
-            return HTMLResponse("""
-                <html><head><title>Access Denied</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-                .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-                .error { color: #e53e3e; margin-bottom: 18px; font-weight: 600; }
-                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; font-weight: 500; }
-                .back:hover { text-decoration: underline; }
-                </style></head><body>
-                <div class='container'>
-                    <div class='error'>🛡️ Direct access denied</div>
-                    <p>Please access your tokens through the main application interface.</p>
-                    <a class='back' href='/'>← Back to Home</a>
-                </div></body></html>
-            """, status_code=403)
 
         current_session = request.session.get("id")
         if not current_session:
@@ -1327,48 +1308,37 @@ async def view_tokens(request: Request):
                 </div></body></html>
             """, status_code=403)
 
-        # Load tokens for the current session only
+        # Load tokens for the current session first
         redis_conn = get_redis_sync()
         tokens = _load_tokens_from_redis_sync(current_session)
         
-        # Security check: ensure tokens exist for this session
+        # If no session tokens, try to get global tokens
+        global_tokens = None
+        global_session = None
         if not tokens or not tokens.get("access_token"):
-            return HTMLResponse("""
-                <html><head><title>No Tokens Found</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-                .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-                .msg { color: #e53e3e; margin-bottom: 18px; font-weight: 600; }
-                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; font-weight: 500; }
-                .back:hover { text-decoration: underline; }
-                </style></head><body>
-                <div class='container'>
-                    <div class='msg'>🔐 No tokens found for your session</div>
-                    <p>Please enter your tokens through the main application first.</p>
-                    <a class='back' href='/'>← Back to Home</a>
-                </div></body></html>
-            """, status_code=403)
+            try:
+                all_keys = redis_conn.keys("tokens:*")
+                for key in all_keys:
+                    key_str = key.decode('utf-8') if isinstance(key, bytes) else str(key)
+                    session_id = key_str.replace("tokens:", "")
+                    if session_id and session_id != current_session:
+                        global_tokens = _load_tokens_from_redis_sync(session_id)
+                        if global_tokens and global_tokens.get("access_token"):
+                            global_session = session_id
+                            break
+            except Exception as e:
+                logger.error(f"Error loading global tokens: {str(e)}")
+        
+        # Use tokens (session or global) for display
+        display_tokens = tokens if (tokens and tokens.get("access_token")) else global_tokens
+        display_session = current_session if (tokens and tokens.get("access_token")) else global_session
         
         # Calculate token expiration times if tokens exist
         token_info = ""
-        if tokens:
+        if display_tokens:
             now = int(time.time())
-            access_expires_in = max(0, tokens.get("expires_at", 0) - now)
-            refresh_expires_in = max(0, tokens.get("refresh_expires_at", 0) - now)
-            
-            # If tokens are expired, try to refresh them
-            if access_expires_in <= 0 and "refresh_token" in tokens:
-                try:
-                    new_tokens = await refresh_access_token(tokens["refresh_token"])
-                    if new_tokens:
-                        await save_tokens_to_redis(current_session, new_tokens)
-                        tokens = new_tokens
-                        access_expires_in = max(0, tokens.get("expires_at", 0) - now)
-                        refresh_expires_in = max(0, tokens.get("refresh_expires_at", 0) - now)
-                        logger.info(f"Refreshed tokens for session {current_session}")
-                except Exception as e:
-                    logger.error(f"Token refresh failed: {str(e)}")
+            access_expires_in = max(0, display_tokens.get("expires_at", 0) - now)
+            refresh_expires_in = max(0, display_tokens.get("refresh_expires_at", 0) - now)
             
             token_info = f"""
             <div class='token-info'>
@@ -1377,6 +1347,8 @@ async def view_tokens(request: Request):
             </div>
             """
 
+        token_source = "Session" if (tokens and tokens.get("access_token")) else ("Global" if (global_tokens and global_tokens.get("access_token")) else None)
+        
         html_content = f"""
         <html><head><title>My Tokens</title>
         <style>
@@ -1385,17 +1357,20 @@ async def view_tokens(request: Request):
         h2 {{ color: #2d3748; margin-bottom: 18px; }}
         pre {{ background: #f7fafc; border-radius: 6px; padding: 18px; font-size: 1em; color: #2d3748; overflow-x: auto; }}
         .msg {{ color: #e53e3e; margin-bottom: 18px; }}
+        .info {{ color: #2b6cb0; margin-bottom: 18px; }}
         .back {{ display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }}
         .back:hover {{ text-decoration: underline; }}
         .token-info {{ margin: 12px 0; padding: 12px; background: #ebf8ff; border-radius: 6px; }}
         .expiry {{ color: #2b6cb0; margin: 4px 0; }}
         .session {{ font-size: 0.9em; color: #718096; margin-top: 12px; }}
+        .token-source {{ font-size: 0.9em; color: #4a5568; margin-bottom: 12px; font-weight: bold; }}
         </style></head><body>
         <div class='container'>
             <h2>Your Tokens</h2>
-            {token_info if tokens else '<div class="msg">No tokens found for your session.</div>'}
-            {('<pre>' + json.dumps(tokens, indent=2) + '</pre>') if tokens else ''}
-            <div class='session'>Session ID: {current_session}</div>
+            {f'<div class="token-source">Token Source: {token_source}</div>' if token_source else '<div class="msg">No tokens found</div>'}
+            {token_info if display_tokens else ''}
+            {('<pre>' + json.dumps(display_tokens, indent=2) + '</pre>') if display_tokens else ''}
+            <div class='session'>Session ID: {display_session}</div>
             <a class='back' href='/'>Back to Home</a>
         </div></body></html>
         """
