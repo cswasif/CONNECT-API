@@ -1,15 +1,10 @@
 {
-
     "version": 2,
     "regions": ["sin1"],
     "builds": [
         {
             "src": "main.py",
-            "use": "@vercel/python",
-            "config": {
-                "maxLambdaSize": "15mb",
-                "runtime": "python3.9"
-            }
+            "use": "@vercel/python"
         }
     ],
     "routes": [
@@ -22,4 +17,4 @@
         "PYTHONPATH": ".",
         "VERCEL_GITHUB_COMMIT_EMAIL": "md.wasif.faisal@g.bracu.ac.bd"
     }
-} 
+}

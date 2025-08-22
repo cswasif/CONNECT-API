@@ -47,7 +47,7 @@ OAUTH_CLIENT_ID = os.getenv('OAUTH_CLIENT_ID', 'connect-portal')
 OAUTH_CLIENT_SECRET = os.getenv('OAUTH_CLIENT_SECRET', '')
 OAUTH_TOKEN_URL = os.getenv('OAUTH_TOKEN_URL', 'https://sso.bracu.ac.bd/realms/bracu/protocol/openid-connect/token')
 
-# Development mode - set to True for local development
+# Development mode - set to False in production
 DEV_MODE = False
 
 # Configure logging with more detailed format
@@ -120,15 +120,7 @@ class ErrorResponse(BaseModel):
 app = FastAPI()
 
 # Add middleware in correct order
-app.add_middleware(
-    SessionMiddleware,
-    secret_key="super-secret-session-key",
-    session_cookie="connectapi_session",
-    max_age=1800,  # 30 minutes
-    same_site="lax",
-    https_only=False,  # Set to True in production with HTTPS
-    path="/"
-)
+app.add_middleware(SessionMiddleware, secret_key="super-secret-session-key")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_URL] if not DEV_MODE else ["*"],
@@ -163,89 +155,16 @@ async def toggle_debug(mode: str = Query(..., regex="^(debug|trace)$")):
         trace_print(f"Trace mode {'enabled' if TRACE_MODE else 'disabled'}")
         return {"trace_mode": TRACE_MODE}
 
-# Session initialization will be handled by the root endpoint and token endpoints
+@app.middleware("http")
+async def session_error_handler(request: Request, call_next):
+    response = await call_next(request)
+    return response
 
 # Upstash Redis config
-REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:@willing-husky-43244.upstash.io:6379"
+REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIjcDExN2MxMjVlNmRhMTc0ODI1OTlhMzRkZjY1MGFjZGJiNXAxMA@willing-husky-43244.upstash.io:6379"
 
-# Redis client instance cache to avoid creating new connections repeatedly
-_redis_client_cache = None
-
-def get_redis_sync():
-    # Use Upstash Redis with proper configuration from environment variables
-    global _redis_client_cache
-    
-    # Return cached client if available
-    if _redis_client_cache is not None:
-        return _redis_client_cache
-    
-    # Check if we're using Upstash Redis format
-    if "upstash.io" in REDIS_URL and "@" in REDIS_URL:
-        try:
-            from upstash_redis import Redis
-            # Parse Upstash URL format: rediss://default:TOKEN@INSTANCE.upstash.io:6379
-            parts = REDIS_URL.split("@")
-            if len(parts) >= 2:
-                instance_part = parts[1].split(":")[0].replace(".upstash.io", "")
-                token_part = parts[0].split(":")[-1]
-                
-                _redis_client_cache = Redis(
-                    url=f"https://{instance_part}.upstash.io",
-                    token=token_part
-                )
-                return _redis_client_cache
-        except (ImportError, Exception) as e:
-            logger.warning(f"Failed to initialize Upstash Redis: {str(e)}. Falling back to redis-py.")
-    
-    # Fallback to standard redis-py
-    try:
-        import redis
-        import ssl
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
-        _redis_client_cache = redis.from_url(REDIS_URL, decode_responses=True, ssl_cert_reqs=None)
-        return _redis_client_cache
-    except Exception as e:
-        logger.error(f"Failed to initialize Redis: {str(e)}")
-        raise
-
-# Redis helper functions - now all synchronous for Vercel compatibility
-
-def redis_get_sync(redis_conn, key):
-    """Synchronous Redis get operation."""
-    return redis_conn.get(key)
-
-def redis_set_sync(redis_conn, key, value, ex=None):
-    """Synchronous Redis set operation."""
-    if ex is not None:
-        return redis_conn.set(key, value, ex=ex)
-    else:
-        return redis_conn.set(key, value)
-
-def redis_keys_sync(redis_conn, pattern):
-    """Synchronous Redis keys operation."""
-    return redis_conn.keys(pattern)
-
-def redis_delete_sync(redis_conn, key):
-    """Synchronous Redis delete operation."""
-    return redis_conn.delete(key)
-
-# Async wrappers for backward compatibility (but now use sync operations)
 async def get_redis():
-    return get_redis_sync()
-
-async def redis_get(redis_conn, key):
-    return redis_get_sync(redis_conn, key)
-
-async def redis_set(redis_conn, key, value, ex=None):
-    return redis_set_sync(redis_conn, key, value, ex=ex)
-
-async def redis_keys(redis_conn, pattern):
-    return redis_keys_sync(redis_conn, pattern)
-
-async def redis_delete(redis_conn, key):
-    return redis_delete_sync(redis_conn, key)
+    return aioredis.from_url(REDIS_URL, decode_responses=True)
 
 def decode_jwt_token(token: str) -> dict:
     """Decode a JWT token without verification to get expiration time."""
@@ -271,25 +190,28 @@ def decode_jwt_token(token: str) -> dict:
 def with_redis_retry(func):
     """Decorator to retry Redis operations with exponential backoff."""
     @wraps(func)
-    def wrapper(*args, **kwargs):
+    async def wrapper(*args, **kwargs):
         last_error = None
         for attempt in range(REDIS_RETRY_COUNT):
             try:
-                return func(*args, **kwargs)
-            except Exception as e:
+                redis_conn = await get_redis()
+                return await func(redis_conn, *args, **kwargs)
+            except (aioredis.ConnectionError, aioredis.TimeoutError) as e:
                 last_error = e
                 if attempt < REDIS_RETRY_COUNT - 1:  # Don't sleep on last attempt
-                    time.sleep(REDIS_RETRY_DELAY * (2 ** attempt))
+                    await asyncio.sleep(REDIS_RETRY_DELAY * (2 ** attempt))
                 continue
+            except Exception as e:
+                logger.error(f"Unexpected error in Redis operation: {str(e)}")
+                raise
         logger.error(f"Redis operation failed after {REDIS_RETRY_COUNT} attempts: {str(last_error)}")
         raise last_error
     return wrapper
 
 @with_redis_retry
-def _save_tokens_to_redis_sync(session_id, tokens):
+async def save_tokens_to_redis(redis_conn, session_id, tokens):
     """Save tokens to Redis with proper expiration time from JWT."""
     try:
-        redis_conn = get_redis_sync()
         now = int(time.time())
         
         # Get expiration from JWT if we have an access token
@@ -300,21 +222,20 @@ def _save_tokens_to_redis_sync(session_id, tokens):
                 tokens["expires_in"] = max(0, jwt_data["exp"] - now)
                 debug_print(f"Token expiration from JWT: {tokens['expires_in']} seconds remaining")
             else:
-                # Increased default expiration to 10 minutes
-                tokens["expires_at"] = now + 600
-                tokens["expires_in"] = 600
-                logger.warning("No expiration found in JWT, using default 10 minutes")
+                tokens["expires_at"] = now + 300
+                tokens["expires_in"] = 300
+                logger.warning("No expiration found in JWT, using default 5 minutes")
         
-        # Always set refresh token expiration to 60 minutes from now if we have a refresh token
+        # Always set refresh token expiration to 30 minutes from now if we have a refresh token
         if "refresh_token" in tokens:
-            tokens["refresh_expires_at"] = now + (60 * 60)  # 60 minutes
+            tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes
         
         # Save tokens with expiration
         key = f"tokens:{session_id}"
-        redis_conn.set(key, json.dumps(tokens))
+        await redis_conn.set(key, json.dumps(tokens))
         
         # Set key expiration to match the refresh token expiration
-        redis_conn.expire(key, 60 * 60)  # 60 minutes
+        await redis_conn.expire(key, 30 * 60)  # 30 minutes
         
         debug_print(f"Tokens saved in Redis for session {session_id}. Access token expires in {tokens.get('expires_in', 0)}s")
         return True
@@ -324,60 +245,35 @@ def _save_tokens_to_redis_sync(session_id, tokens):
             trace_print(f"Stack trace:\n{traceback.format_exc()}")
         raise
 
-async def save_tokens_to_redis(session_id, tokens):
-    """Async wrapper for save_tokens_to_redis function."""
-    try:
-        # Use sync version since we're using sync Redis client
-        return _save_tokens_to_redis_sync(session_id, tokens)
-    except Exception as e:
-        logger.error(f"Error in async save_tokens_to_redis: {str(e)}")
-        if DEBUG_MODE or TRACE_MODE:
-            trace_print(f"Stack trace:\n{traceback.format_exc()}")
-        raise
-
 @with_redis_retry
-def _load_tokens_from_redis_sync(session_id):
-    """Load tokens from Redis with validation and refresh if needed."""
+async def load_tokens_from_redis(redis_conn, session_id):
+    """Load tokens from Redis with validation."""
     try:
-        redis_conn = get_redis_sync()
         key = f"tokens:{session_id}"
-        data = redis_conn.get(key)
+        data = await redis_conn.get(key)
         
         if data:
             tokens = json.loads(data)
-            now = int(time.time())
-            
-            # Check if token needs proactive refresh (75% through its lifetime)
-            needs_refresh = False
-            if "expires_at" in tokens and "refresh_token" in tokens:
-                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                if time_elapsed >= (total_lifetime * 0.75):
-                    needs_refresh = True
-                    debug_print(f"Token needs proactive refresh for session {session_id} (75% lifetime elapsed)")
-            
-            # If token is not expired and doesn't need proactive refresh
-            if not is_token_expired(tokens) and not needs_refresh:
+            # Validate token expiration
+            if not is_token_expired(tokens):
                 debug_print(f"Valid tokens loaded from Redis for session {session_id}")
                 return tokens
-            
-            # Try to refresh the token if we have a refresh token
-            if "refresh_token" in tokens:
-                try:
-                    debug_print(f"Attempting token refresh for session {session_id}")
-                    new_tokens = refresh_access_token_sync(tokens["refresh_token"])
-                    if new_tokens:
-                        new_tokens["activated_at"] = now
-                        _save_tokens_to_redis_sync(session_id, new_tokens)
-                        return new_tokens
-                except Exception as e:
-                    logger.error(f"Token refresh failed (sync): {str(e)}")
-                    if DEV_MODE:
-                        logger.error(traceback.format_exc())
-            
-            # If we get here, tokens are expired/invalid and refresh failed
-            redis_conn.delete(key)
-            return None
+            else:
+                debug_print(f"Expired tokens found for session {session_id}, attempting refresh")
+                if "refresh_token" in tokens:
+                    try:
+                        new_tokens = await refresh_access_token(tokens["refresh_token"])
+                        if new_tokens:
+                            await save_tokens_to_redis(session_id, new_tokens)
+                            return new_tokens
+                    except Exception as e:
+                        logger.error(f"Token refresh failed: {str(e)}")
+                        if DEV_MODE:
+                            logger.error(traceback.format_exc())
+                
+                # If we get here, tokens are expired and refresh failed
+                await redis_conn.delete(key)
+                return None
         else:
             debug_print(f"No tokens found in Redis for session {session_id}")
             return None
@@ -387,84 +283,22 @@ def _load_tokens_from_redis_sync(session_id):
             logger.error(traceback.format_exc())
         return None
 
-async def load_tokens_from_redis(session_id):
-    """Async wrapper for load_tokens_from_redis function with token refresh."""
+async def save_global_student_tokens(student_id, tokens):
     try:
-        redis_conn = get_redis_sync()
-        key = f"tokens:{session_id}"
-        data = redis_conn.get(key)
-        
-        if data:
-            tokens = json.loads(data)
-            now = int(time.time())
-            
-            # Check if token needs proactive refresh (75% through its lifetime)
-            needs_refresh = False
-            if "expires_at" in tokens and "refresh_token" in tokens:
-                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                if time_elapsed >= (total_lifetime * 0.75):
-                    needs_refresh = True
-                    debug_print(f"Token needs proactive refresh for session {session_id} (75% lifetime elapsed)")
-            
-            # If token is not expired and doesn't need proactive refresh
-            if not is_token_expired(tokens) and not needs_refresh:
-                debug_print(f"Valid tokens loaded from Redis for session {session_id}")
-                return tokens
-            
-            # Try to refresh the token if we have a refresh token
-            if "refresh_token" in tokens:
-                try:
-                    debug_print(f"Attempting token refresh for session {session_id}")
-                    new_tokens = await refresh_access_token(tokens["refresh_token"])
-                    if new_tokens:
-                        new_tokens["activated_at"] = now
-                        await save_tokens_to_redis(session_id, new_tokens)
-                        return new_tokens
-                except Exception as e:
-                    logger.error(f"Token refresh failed: {str(e)}")
-                    if DEV_MODE:
-                        logger.error(traceback.format_exc())
-            
-            # If we get here, tokens are expired/invalid and refresh failed
-            redis_conn.delete(key)
-            return None
-        else:
-            debug_print(f"No tokens found in Redis for session {session_id}")
-            return None
-    except Exception as e:
-        logger.error(f"Error loading tokens from Redis: {str(e)}")
-        if DEV_MODE:
-            logger.error(traceback.format_exc())
-        return None
-
-@with_redis_retry
-def _save_global_student_tokens_sync(student_id, tokens):
-    try:
-        redis_conn = get_redis_sync()
+        redis_conn = await get_redis()
         if "expires_in" in tokens:
             tokens["expires_at"] = int(time.time()) + int(tokens["expires_in"])
-        redis_conn.set(f"student_tokens:{student_id}", json.dumps(tokens))
+        await redis_conn.set(f"student_tokens:{student_id}", json.dumps(tokens))
         logger.info(f"Global tokens updated for student_id {student_id}.")
         return True
     except Exception as e:
         logger.error(f"Error saving global student tokens to Redis: {str(e)}")
         raise
 
-async def save_global_student_tokens(student_id, tokens):
+async def load_global_student_tokens(student_id):
     try:
-        return _save_global_student_tokens_sync(student_id, tokens)
-    except Exception as e:
-        logger.error(f"Error in async save_global_student_tokens: {str(e)}")
-        if DEBUG_MODE or TRACE_MODE:
-            trace_print(f"Stack trace:\n{traceback.format_exc()}")
-        raise
-
-@with_redis_retry
-def _load_global_student_tokens_sync(student_id):
-    try:
-        redis_conn = get_redis_sync()
-        data = redis_conn.get(f"student_tokens:{student_id}")
+        redis_conn = await get_redis()
+        data = await redis_conn.get(f"student_tokens:{student_id}")
         if data:
             tokens = json.loads(data)
             logger.info(f"Global tokens loaded for student_id {student_id}.")
@@ -476,42 +310,20 @@ def _load_global_student_tokens_sync(student_id):
         logger.error(f"Error loading global student tokens from Redis: {str(e)}")
         return None
 
-async def load_global_student_tokens(student_id):
+async def save_student_schedule(student_id, schedule):
     try:
-        return _load_global_student_tokens_sync(student_id)
-    except Exception as e:
-        logger.error(f"Error in async load_global_student_tokens: {str(e)}")
-        if DEBUG_MODE or TRACE_MODE:
-            trace_print(f"Stack trace:\n{traceback.format_exc()}")
-        return None
-
-@with_redis_retry
-def _save_student_schedule_sync(student_id, schedule):
-    try:
-        redis_conn = get_redis_sync()
-        redis_conn.set(f"student_schedule:{student_id}", json.dumps(schedule))
+        redis_conn = await get_redis()
+        await redis_conn.set(f"student_schedule:{student_id}", json.dumps(schedule))
         logger.info(f"Schedule cached for student_id {student_id} (no expiration).")
         return True
     except Exception as e:
         logger.error(f"Error saving student schedule to Redis: {str(e)}")
         raise
 
-async def save_student_schedule(student_id, schedule):
+async def load_student_schedule(student_id):
     try:
-        # Get the result directly without creating a coroutine
-        result = _save_student_schedule_sync(student_id, schedule)
-        return result
-    except Exception as e:
-        logger.error(f"Error in async save_student_schedule: {str(e)}")
-        if DEBUG_MODE or TRACE_MODE:
-            trace_print(f"Stack trace:\n{traceback.format_exc()}")
-        raise
-
-@with_redis_retry
-def _load_student_schedule_sync(student_id):
-    try:
-        redis_conn = get_redis_sync()
-        data = redis_conn.get(f"student_schedule:{student_id}")
+        redis_conn = await get_redis()
+        data = await redis_conn.get(f"student_schedule:{student_id}")
         if data:
             schedule = json.loads(data)
             logger.info(f"Schedule loaded from cache for student_id {student_id}.")
@@ -523,17 +335,6 @@ def _load_student_schedule_sync(student_id):
         logger.error(f"Error loading student schedule from Redis: {str(e)}")
         return None
 
-async def load_student_schedule(student_id):
-    try:
-        # Get the result directly without creating a coroutine
-        result = _load_student_schedule_sync(student_id)
-        return result
-    except Exception as e:
-        logger.error(f"Error in async load_student_schedule: {str(e)}")
-        if DEBUG_MODE or TRACE_MODE:
-            trace_print(f"Stack trace:\n{traceback.format_exc()}")
-        return None
-
 def get_basic_auth_header():
     """Generate Basic Auth header from environment variables."""
     if not OAUTH_CLIENT_SECRET:
@@ -542,69 +343,6 @@ def get_basic_auth_header():
     credentials = f"{OAUTH_CLIENT_ID}:{OAUTH_CLIENT_SECRET}"
     encoded = base64.b64encode(credentials.encode()).decode()
     return f"Basic {encoded}"
-
-def refresh_access_token_sync(refresh_token: str) -> dict:
-    """Synchronous version to refresh the access token using the refresh token."""
-    token_url = "https://sso.bracu.ac.bd/realms/bracu/protocol/openid-connect/token"
-    data = {
-        "grant_type": "refresh_token",
-        "client_id": "slm",  # Using the working client_id from old implementation
-        "refresh_token": refresh_token,
-    }
-    
-    try:
-        import requests
-        logger.debug(f"Trying token refresh at: {token_url} (sync)")
-        resp = requests.post(token_url, data=data, timeout=10.0)
-        logger.debug(f"Token refresh response: {resp.status_code} {resp.text}")
-        
-        if resp.status_code == 200:
-            try:
-                new_tokens = resp.json()
-                if isinstance(new_tokens, dict) and "access_token" in new_tokens:
-                    logger.info("Successfully refreshed access token (sync)")
-                    now = int(time.time())
-                    
-                    # Get expiration from new access token
-                    access_jwt_data = decode_jwt_token(new_tokens["access_token"])
-                    if "exp" in access_jwt_data:
-                        new_tokens["expires_at"] = access_jwt_data["exp"]
-                        new_tokens["expires_in"] = max(0, access_jwt_data["exp"] - now)
-                    
-                    # If we got a new refresh token, get its expiration
-                    if "refresh_token" in new_tokens:
-                        refresh_jwt_data = decode_jwt_token(new_tokens["refresh_token"])
-                        if "exp" in refresh_jwt_data:
-                            new_tokens["refresh_expires_at"] = refresh_jwt_data["exp"]
-                        else:
-                            new_tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes default
-                    else:
-                        # Keep the old refresh token if we didn't get a new one
-                        new_tokens["refresh_token"] = refresh_token
-                        refresh_jwt_data = decode_jwt_token(refresh_token)
-                        if "exp" in refresh_jwt_data:
-                            new_tokens["refresh_expires_at"] = refresh_jwt_data["exp"]
-                        else:
-                            new_tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes default
-                    
-                    logger.info(f"New tokens (sync): Access expires in {new_tokens.get('expires_in')}s, "
-                              f"Refresh expires in {new_tokens.get('refresh_expires_at', 0) - now}s")
-                    return new_tokens
-                else:
-                    logger.error(f"Invalid token refresh response format (sync)")
-                    return None
-            except Exception as e:
-                logger.error(f"Failed to parse token refresh response (sync): {str(e)}")
-                return None
-        elif resp.status_code == 401:
-            logger.error("Refresh token has expired or is invalid (sync)")
-            return None
-        else:
-            logger.error(f"Failed to refresh token (sync): {resp.status_code} {resp.text}")
-            return None
-    except Exception as e:
-        logger.error(f"Error refreshing token (sync): {str(e)}")
-        return None
 
 async def refresh_access_token(refresh_token: str) -> dict:
     """Refresh the access token using the refresh token."""
@@ -669,7 +407,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         logger.error(f"Error refreshing token: {str(e)}")
         return None
 
-def is_token_expired(tokens, buffer=300):  # Increased buffer to 5 minutes
+def is_token_expired(tokens, buffer=60):
     """Check if tokens are expired with a buffer time."""
     if not tokens:
         return True
@@ -681,56 +419,14 @@ def is_token_expired(tokens, buffer=300):  # Increased buffer to 5 minutes
     return False
 
 @with_redis_retry
-def get_latest_valid_token_sync():
-    """Get the most recent valid token from Redis synchronously."""
-    try:
-        redis_conn = get_redis_sync()
-            
-        # Get all token keys
-        token_keys = redis_conn.keys("tokens:*")
-        if not token_keys:
-            logger.warning("No tokens found in Redis")
-            return None
-            
-        latest_token = None
-        latest_expiry = 0
-        session_id = None
-        
-        # First try to find the most recent valid token
-        for key in token_keys:
-            tokens_str = redis_conn.get(key)
-            if tokens_str:
-                try:
-                    tokens = json.loads(tokens_str)
-                    if "expires_at" in tokens:
-                        # If this token expires later than our current latest, update it
-                        if tokens["expires_at"] > latest_expiry:
-                            latest_token = tokens
-                            latest_expiry = tokens["expires_at"]
-                            session_id = key.split(":")[-1]
-                except json.JSONDecodeError:
-                    continue
-        
-        # If we found a valid token that doesn't need refresh, use it
-        if latest_token and not is_token_expired(latest_token):
-            logger.info("Using existing valid token")
-            return latest_token.get("access_token")
-        
-        logger.warning("No valid tokens found")
-        return None
-    except Exception as e:
-        logger.error(f"Error in get_latest_valid_token_sync: {str(e)}")
-        return None
-
-@with_redis_retry
-async def get_latest_valid_token():
+async def get_latest_valid_token(redis_conn=None):
     """Get the most recent valid token from Redis, attempting to refresh if needed."""
     try:
-        redis_conn = get_redis_sync()
-        now = int(time.time())
+        if not redis_conn:
+            redis_conn = await get_redis()
             
         # Get all token keys
-        token_keys = redis_conn.keys("tokens:*")
+        token_keys = await redis_conn.keys("tokens:*")
         if not token_keys:
             logger.warning("No tokens found in Redis")
             return None
@@ -742,25 +438,17 @@ async def get_latest_valid_token():
         
         # First try to find the most recent valid token
         for key in token_keys:
-            tokens_str = redis_conn.get(key)
+            tokens_str = await redis_conn.get(key)
             if tokens_str:
                 try:
                     tokens = json.loads(tokens_str)
                     if "expires_at" in tokens:
-                        # Check if this token expires later than our current latest
+                        # If this token expires later than our current latest, update it
                         if tokens["expires_at"] > latest_expiry:
                             latest_token = tokens
                             latest_expiry = tokens["expires_at"]
-                            session_id = key.split(":")[-1]
-                            
-                            # Check if token needs proactive refresh
                             needs_refresh = is_token_expired(tokens)
-                            if not needs_refresh and "refresh_token" in tokens:
-                                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                                if time_elapsed >= (total_lifetime * 0.75):
-                                    needs_refresh = True
-                                    debug_print(f"Latest token needs proactive refresh (75% lifetime elapsed)")
+                            session_id = key.split(":")[-1]
                 except json.JSONDecodeError:
                     continue
         
@@ -773,17 +461,16 @@ async def get_latest_valid_token():
         if latest_token and "refresh_token" in latest_token and session_id:
             logger.info("Attempting to refresh token")
             try:
-                new_tokens = refresh_access_token_sync(latest_token["refresh_token"])
+                new_tokens = await refresh_access_token(latest_token["refresh_token"])
                 if new_tokens and "access_token" in new_tokens:
-                    # Add activation time and save the refreshed tokens
-                    new_tokens["activated_at"] = now
-                    _save_tokens_to_redis_sync(session_id, new_tokens)
+                    # Save the refreshed tokens
+                    await save_tokens_to_redis(session_id, new_tokens)
                     logger.info("Successfully refreshed token")
                     return new_tokens.get("access_token")
             except Exception as e:
                 logger.error(f"Error refreshing token: {str(e)}")
                 # Delete the expired/invalid tokens
-                redis_conn.delete(f"tokens:{session_id}")
+                await redis_conn.delete(f"tokens:{session_id}")
         
         logger.warning("No valid tokens found and refresh attempts failed")
         return None
@@ -817,101 +504,13 @@ async def root(request: Request):
     # Calculate token remaining time
     token_remaining_display = "No active token."
     section_status_display = ""
-    global_token_display = ""
-    
-    # Get global token status
     try:
-        redis_conn = get_redis_sync()
-        token_keys = redis_conn.keys("tokens:*")
-        
-        if token_keys:
-            total_sessions = len(token_keys)
-            active_sessions = 0
-            earliest_expiry = None
-            earliest_created = None
-            
-            for key in token_keys:
-                try:
-                    tokens_str = redis_conn.get(key)
-                    if tokens_str:
-                        tokens = json.loads(tokens_str)
-                        if tokens and "access_token" in tokens and not is_token_expired(tokens):
-                            active_sessions += 1
-                            if "expires_at" in tokens:
-                                expiry = tokens["expires_at"]
-                                if earliest_expiry is None or expiry < earliest_expiry:
-                                    earliest_expiry = expiry
-                            # Get creation time from activated_at field
-                            created_at = tokens.get("activated_at", tokens.get("created_at"))
-                            if created_at is None:
-                                # Fallback to current time if no creation timestamp
-                                created_at = int(time.time())
-                            if earliest_created is None or created_at < earliest_created:
-                                earliest_created = created_at
-                except:
-                    continue
-            
-            if active_sessions > 0 and earliest_created:
-                now = int(time.time())
-                uptime_seconds = max(0, now - earliest_created)
-                remaining = max(0, earliest_expiry - now)
-                
-                # Format uptime
-                uptime_parts = []
-                if uptime_seconds >= 86400:
-                    days = uptime_seconds // 86400
-                    uptime_parts.append(f"{days}d")
-                    hours = (uptime_seconds % 86400) // 3600
-                    if hours > 0:
-                        uptime_parts.append(f"{hours}h")
-                elif uptime_seconds >= 3600:
-                    hours = uptime_seconds // 3600
-                    uptime_parts.append(f"{hours}h")
-                    minutes = (uptime_seconds % 3600) // 60
-                    if minutes > 0:
-                        uptime_parts.append(f"{minutes}m")
-                else:
-                    minutes = uptime_seconds // 60
-                    if minutes > 0:
-                        uptime_parts.append(f"{minutes}m")
-                    seconds = uptime_seconds % 60
-                    uptime_parts.append(f"{seconds}s")
-                
-                # Format remaining time
-                remaining_parts = []
-                if remaining > 0:
-                    days, remainder = divmod(remaining, 86400)
-                    hours, remainder = divmod(remainder, 3600)
-                    minutes, seconds = divmod(remainder, 60)
-                    
-                    if days:
-                        remaining_parts.append(f"{days}d")
-                    if hours:
-                        remaining_parts.append(f"{hours}h")
-                    if minutes:
-                        remaining_parts.append(f"{minutes}m")
-                    if seconds or not remaining_parts:
-                        remaining_parts.append(f"{seconds}s")
-                
-                uptime_str = " ".join(uptime_parts)
-                remaining_str = " ".join(remaining_parts)
-                
-                global_token_display = f'<div class="info-box success">🟢 Global token active: {active_sessions}/{total_sessions} sessions valid (uptime: {uptime_str}, expires in {remaining_str})</div>'
-            else:
-                global_token_display = f'<div class="info-box">🔴 No active global tokens: {total_sessions} expired sessions</div>'
-        else:
-            global_token_display = '<div class="info-box">🔴 No tokens stored in system</div>'
-    except Exception:
-        global_token_display = '<div class="info-box error">⚠️ Unable to check global token status</div>'
-    
-    # Check user's personal token
-    try:
-        tokens = _load_tokens_from_redis_sync(session_id)
+        tokens = await load_tokens_from_redis(session_id)
         if tokens and "access_token" in tokens and not is_token_expired(tokens):
             token = tokens["access_token"]
             
             # Check section count if we have a valid token
-            with httpx.Client() as client:
+            async with httpx.AsyncClient() as client:
                 headers = {
                     "Accept": "application/json",
                     "Authorization": f"Bearer {token}",
@@ -921,11 +520,11 @@ async def root(request: Request):
                 }
                 
                 url = "https://connect.bracu.ac.bd/api/adv/v1/advising/sections"
-                resp = client.get(url, headers=headers)
+                resp = await client.get(url, headers=headers)
                 
                 if resp.status_code == 200:
                     sections = resp.json()
-                    has_changed, current, stored = check_section_changes_sync(sections)
+                    has_changed, current, stored = await check_section_changes(sections)
                     if has_changed:
                         section_status_display = f'<div class="section-status warning">Section count changed from {stored} to {current}. Consider updating lab cache.</div>'
             
@@ -982,7 +581,6 @@ async def root(request: Request):
     <script>
     let currentTaskId = null;
     let statusCheckInterval = null;
-    let tokenCheckInterval = null;
     let isPageVisible = true;
     let retryCount = 0;
     const MAX_RETRIES = 3;
@@ -1111,38 +709,6 @@ async def root(request: Request):
         checkStatus();  // Check immediately
     }}
 
-    async function checkTokenStatus() {{
-        try {{
-            const response = await fetch('/token-status');
-            const data = await response.json();
-            
-            const tokenStatusEl = document.getElementById('token-status-display');
-            if (!tokenStatusEl) return;
-            
-            let statusClass = '';
-            let statusText = '';
-            
-            if (data.valid) {{
-                statusClass = 'success';
-                statusText = `Token Valid ✓ (ID: ${{data.id}})`;
-            }} else {{
-                statusClass = 'error';
-                statusText = 'Token Expired ✗';
-            }}
-            
-            tokenStatusEl.innerHTML = `<div class="info-box ${{statusClass}}">${{statusText}}</div>`;
-            
-        }} catch (error) {{
-            console.error('Error checking token status:', error);
-        }}
-    }}
-
-    function startTokenCheck() {{
-        if (tokenCheckInterval) clearInterval(tokenCheckInterval);
-        tokenCheckInterval = setInterval(checkTokenStatus, 5000); // Check every 5 seconds
-        checkTokenStatus(); // Check immediately
-    }}
-
     // Check for existing task on page load
     window.onload = function() {{
         const urlParams = new URLSearchParams(window.location.search);
@@ -1152,7 +718,6 @@ async def root(request: Request):
             document.getElementById('updateStatus').style.display = 'block';
             startStatusCheck();
         }}
-        startTokenCheck(); // Start token validation on page load
     }};
     </script></head><body>
     <div class='container'>
@@ -1160,7 +725,7 @@ async def root(request: Request):
         <div class='desc'>A simple client to view your BRACU Connect schedule.<br>Session-based, no password required.</div>
         <div class='button-container'>
             <a class='button' href='/enter-tokens'>Enter Tokens</a>
-            <a class='button' href='/mytokens'>View Tokens</a>
+            {f"<a class='button' href='/mytokens'>View Tokens</a>" if SHOW_VIEW_TOKENS else ""}
             <a class='button' href='/raw-schedule'>View Raw Schedule</a>
             <button class='button update' onclick='updateLabs()'>Update Lab Cache</button>
         </div>
@@ -1169,8 +734,6 @@ async def root(request: Request):
         <div class='session-id'>Session: {session_id}</div>
         <div class='network-uptime'>{network_uptime_display}</div>
         <div class='token-remaining'>{token_remaining_display}</div>
-        {global_token_display}
-        <div id='token-status-display' style='margin-top: 8px; text-align: center;'></div>
         <div class='footer'>API server by <b>Wasif Faisal</b> to support <a href='https://routinez.vercel.app/' target='_blank'>Routinez</a></div>
     </div></body></html>
     """
@@ -1250,71 +813,48 @@ async def save_tokens_form(request: Request, access_token: str = Form(...), refr
     return HTMLResponse(html_content)
 
 @app.get("/mytokens", response_class=HTMLResponse)
-async def view_tokens(request: Request):
-    """View tokens for the current authenticated session only."""
+async def view_tokens(request: Request, session_id: str = None):
+    """View tokens for the current session."""
     try:
-        # Enhanced security: Check referrer to prevent direct access
-        referrer = request.headers.get("referer", "")
-        if not referrer or not any(domain in referrer for domain in ["localhost:8000", "127.0.0.1:8000"]):
-            return HTMLResponse("""
-                <html><head><title>Access Denied</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-                .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-                .error { color: #e53e3e; margin-bottom: 18px; font-weight: 600; }
-                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; font-weight: 500; }
-                .back:hover { text-decoration: underline; }
-                </style></head><body>
-                <div class='container'>
-                    <div class='error'>🛡️ Direct access denied</div>
-                    <p>Please access your tokens through the main application interface.</p>
-                    <a class='back' href='/'>← Back to Home</a>
-                </div></body></html>
-            """, status_code=403)
-
         current_session = request.session.get("id")
         if not current_session:
-            # No session, redirect to home with security message
+            # No session, redirect to home
+            return RedirectResponse("/", status_code=302)
+        
+        # If a specific session_id is requested, verify it matches the current session
+        if session_id and session_id != current_session:
             return HTMLResponse("""
-                <html><head><title>Access Denied</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <html><head><title>Error</title>
                 <style>
                 body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
                 .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-                .error { color: #e53e3e; margin-bottom: 18px; font-weight: 600; }
-                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; font-weight: 500; }
+                .error { color: #e53e3e; margin-bottom: 18px; }
+                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; }
                 .back:hover { text-decoration: underline; }
                 </style></head><body>
                 <div class='container'>
-                    <div class='error'>🔒 Access Denied</div>
-                    <p>You must access this page from the main application.</p>
-                    <a class='back' href='/'>← Back to Home</a>
+                    <div class='error'>You can only view tokens for your own session.</div>
+                    <a class='back' href='/'>Back to Home</a>
                 </div></body></html>
             """, status_code=403)
 
-        # Load tokens for the current session only
-        redis_conn = get_redis_sync()
-        tokens = _load_tokens_from_redis_sync(current_session)
+        # Load tokens for the current session
+        redis_conn = await get_redis()
+        tokens = await load_tokens_from_redis(redis_conn, current_session)
         
-        # Security check: ensure tokens exist for this session
-        if not tokens or not tokens.get("access_token"):
-            return HTMLResponse("""
-                <html><head><title>No Tokens Found</title>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <style>
-                body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f5; margin: 0; }
-                .container { max-width: 520px; margin: 60px auto; background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.08); padding: 36px 28px; text-align: center; }
-                .msg { color: #e53e3e; margin-bottom: 18px; font-weight: 600; }
-                .back { display: block; margin-top: 18px; color: #3182ce; text-decoration: none; font-weight: 500; }
-                .back:hover { text-decoration: underline; }
-                </style></head><body>
-                <div class='container'>
-                    <div class='msg'>🔐 No tokens found for your session</div>
-                    <p>Please enter your tokens through the main application first.</p>
-                    <a class='back' href='/'>← Back to Home</a>
-                </div></body></html>
-            """, status_code=403)
+        # If no tokens found in current session, try to get the latest valid token
+        if not tokens:
+            latest_token = await get_latest_valid_token(redis_conn)
+            if latest_token:
+                # Create new tokens object with the latest token
+                tokens = {
+                    "access_token": latest_token,
+                    "expires_at": int(time.time()) + 300,  # 5 minutes default
+                    "refresh_expires_at": int(time.time()) + 1800  # 30 minutes default
+                }
+                # Save these tokens to the current session
+                await save_tokens_to_redis(current_session, tokens)
+                logger.info(f"Saved latest valid token to session {current_session}")
         
         # Calculate token expiration times if tokens exist
         token_info = ""
@@ -1413,8 +953,8 @@ async def get_seat_status(token: str) -> dict:
 async def get_section_count_from_redis():
     """Get the stored section count from Redis."""
     try:
-        redis_conn = get_redis_sync()
-        count = redis_conn.get("total_section_count")
+        redis_conn = await get_redis()
+        count = await redis_conn.get("total_section_count")
         return int(count) if count else None
     except Exception as e:
         logger.error(f"Error getting section count from Redis: {str(e)}")
@@ -1423,8 +963,8 @@ async def get_section_count_from_redis():
 async def save_section_count_to_redis(count: int):
     """Save the current section count to Redis."""
     try:
-        redis_conn = get_redis_sync()
-        redis_conn.set("total_section_count", str(count))
+        redis_conn = await get_redis()
+        await redis_conn.set("total_section_count", str(count))
         logger.info(f"Saved section count to Redis: {count}")
     except Exception as e:
         logger.error(f"Error saving section count to Redis: {str(e)}")
@@ -1432,26 +972,22 @@ async def save_section_count_to_redis(count: int):
 # Initialize empty lab cache
 lab_cache = {}
 
-def save_lab_cache_to_redis_sync(lab_data: dict):
-    """Save lab section data to Redis synchronously."""
+async def save_lab_cache_to_redis(lab_data: dict):
+    """Save lab section data to Redis."""
     try:
-        redis_conn = get_redis_sync()
-        redis_conn.set("lab_cache", json.dumps(lab_data))
+        redis_conn = await get_redis()
+        await redis_conn.set("lab_cache", json.dumps(lab_data))
         logger.info(f"Saved {len(lab_data)} lab sections to Redis cache")
         return True
     except Exception as e:
         logger.error(f"Error saving lab cache to Redis: {str(e)}")
         return False
 
-async def save_lab_cache_to_redis(lab_data: dict):
-    """Save lab section data to Redis."""
-    return save_lab_cache_to_redis_sync(lab_data)
-
-def load_lab_cache_from_redis_sync():
-    """Load lab section data from Redis synchronously."""
+async def load_lab_cache_from_redis():
+    """Load lab section data from Redis."""
     try:
-        redis_conn = get_redis_sync()
-        data = redis_conn.get("lab_cache")
+        redis_conn = await get_redis()
+        data = await redis_conn.get("lab_cache")
         if data:
             return json.loads(data)
         return {}
@@ -1459,138 +995,29 @@ def load_lab_cache_from_redis_sync():
         logger.error(f"Error loading lab cache from Redis: {str(e)}")
         return {}
 
-async def load_lab_cache_from_redis():
-    """Load lab section data from Redis."""
-    return load_lab_cache_from_redis_sync()
-
-def deduplicate_lab_cache_sync():
-    """Deduplicate lab cache based on labSectionId to prevent duplicates synchronously."""
-    global lab_cache
-    seen_lab_sections = set()
-    seen_parent_sections = set()
-    deduplicated_cache = {}
-    duplicates_removed = 0
-    
-    for parent_section_id, lab_info in lab_cache.items():
-        lab_section_id = str(lab_info.get("labSectionId", ""))
-        
-        # Skip if parent_section_id is duplicated
-        if parent_section_id in seen_parent_sections:
-            duplicates_removed += 1
-            continue
-            
-        # Check for duplicate labSectionId
-        if lab_section_id and lab_section_id in seen_lab_sections:
-            duplicates_removed += 1
-            continue
-            
-        # Add to seen sets
-        seen_parent_sections.add(parent_section_id)
-        if lab_section_id:
-            seen_lab_sections.add(lab_section_id)
-            
-        deduplicated_cache[parent_section_id] = lab_info
-    
-    if duplicates_removed > 0:
-        logger.info(f"Removed {duplicates_removed} duplicate lab sections from cache")
-        lab_cache = deduplicated_cache
-        save_lab_cache_to_redis_sync(lab_cache)
-    
-    return len(lab_cache)
-
-async def deduplicate_lab_cache():
-    """Deduplicate lab cache based on labSectionId to prevent duplicates."""
-    return deduplicate_lab_cache_sync()
-
-def validate_lab_cache_sync():
-    """Validate lab cache data integrity and remove invalid entries synchronously."""
-    global lab_cache
-    invalid_entries = 0
-    valid_cache = {}
-    
-    for parent_section_id, lab_info in lab_cache.items():
-        # Check if lab_info has required fields
-        if not isinstance(lab_info, dict):
-            invalid_entries += 1
-            continue
-            
-        lab_section_id = lab_info.get("labSectionId")
-        lab_course_code = lab_info.get("labCourseCode")
-        
-        # Validate required fields
-        if not lab_section_id or not lab_course_code:
-            invalid_entries += 1
-            continue
-            
-        # Validate data types
-        if not isinstance(lab_section_id, (str, int)):
-            invalid_entries += 1
-            continue
-            
-        valid_cache[parent_section_id] = lab_info
-    
-    if invalid_entries > 0:
-        logger.warning(f"Removed {invalid_entries} invalid lab cache entries")
-        lab_cache = valid_cache
-        save_lab_cache_to_redis_sync(lab_cache)
-    
-    return len(lab_cache)
-
-async def validate_lab_cache():
-    """Validate lab cache data integrity and remove invalid entries."""
-    return validate_lab_cache_sync()
-
-def initialize_lab_cache_sync():
-    """Initialize lab cache from Redis synchronously."""
+async def initialize_lab_cache():
+    """Initialize lab cache from Redis."""
     global lab_cache
     try:
-        lab_cache = load_lab_cache_from_redis_sync()
+        lab_cache = await load_lab_cache_from_redis()
         logger.info(f"Loaded {len(lab_cache)} lab sections from Redis cache")
-        
-        # Deduplicate cache on initialization
-        deduplicate_lab_cache_sync()
-        
-        # Validate cache integrity
-        validate_lab_cache_sync()
-        
     except Exception as e:
         logger.warning(f"Could not load lab cache from Redis: {str(e)}. Starting with empty lab cache.")
 
-async def initialize_lab_cache():
-    """Initialize lab cache from Redis."""
-    return initialize_lab_cache_sync()
-
 # Initialize lab cache on startup
 @app.on_event("startup")
-def startup_event():
-    initialize_lab_cache_sync()
+async def startup_event():
+    await initialize_lab_cache()
 
-@app.get("/clear-lab-cache")
-def clear_lab_cache():
-    """Clear the lab cache and reset it to empty."""
-    global lab_cache
-    try:
-        lab_cache = {}
-        redis_conn = get_redis_sync()
-        redis_conn.delete("lab_cache")
-        logger.info("Lab cache cleared successfully")
-        return {"message": "Lab cache cleared successfully", "status": "success"}
-    except Exception as e:
-        logger.error(f"Error clearing lab cache: {str(e)}")
-        return {"message": f"Error clearing lab cache: {str(e)}", "status": "error"}
-
-def update_lab_cache_sync(token: str, sections: list):
+async def update_lab_cache(token: str, sections: list):
     """Update lab cache with new lab sections found in the provided sections list."""
     global lab_cache
     updated_lab_data = []
     
     # Ensure lab_cache is loaded from Redis if it's empty
     if not lab_cache:
-        lab_cache = load_lab_cache_from_redis_sync() or {}
+        lab_cache = await load_lab_cache_from_redis() or {}
         logger.info(f"Loaded {len(lab_cache)} lab sections from Redis cache")
-    
-    # Create a lookup dictionary for faster section access
-    section_dict = {str(section.get("sectionId")): idx for idx, section in enumerate(sections) if section.get("sectionId")}
     
     # Filter sections that need to be checked for labs - only from the provided sections list
     sections_to_check = [
@@ -1603,92 +1030,70 @@ def update_lab_cache_sync(token: str, sections: list):
     
     if sections_to_check:
         logger.info(f"Found {len(sections_to_check)} new sections to check for labs in current schedule")
-        
-        # Process sections in batches to limit concurrent requests
-        batch_size = 5  # Process 5 sections at a time
-        
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Mozilla/5.0",
-            "Origin": "https://connect.bracu.ac.bd",
-            "Referer": "https://connect.bracu.ac.bd/"
-        }
-        
-        # Process sections in batches using synchronous client
-        with httpx.Client(timeout=15.0) as client:
-            for i in range(0, len(sections_to_check), batch_size):
-                batch = sections_to_check[i:i+batch_size]
-                
-                for section in batch:
-                    section_id = str(section.get("sectionId"))
+        async with httpx.AsyncClient() as client:
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0",
+                "Origin": "https://connect.bracu.ac.bd",
+                "Referer": "https://connect.bracu.ac.bd/"
+            }
+            
+            for section in sections_to_check:
+                section_id = str(section.get("sectionId"))
+                try:
                     # Skip if already in cache
                     if section_id in lab_cache:
                         continue
                         
                     url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/{section_id}/details"
                     
-                    try:
-                        response = client.get(url, headers=headers)
-                        
-                        if response.status_code == 200:
-                            details_data = response.json()
-                            child_section = details_data.get("childSection")
-                            if child_section:
-                                # Parse sectionSchedule if it's a string
-                                lab_schedule = child_section.get("sectionSchedule")
-                                if isinstance(lab_schedule, str):
-                                    try:
-                                        lab_schedule = json.loads(lab_schedule)
-                                    except:
-                                        lab_schedule = None
-                                
-                                lab_info = {
-                                    "sectionId": section_id,
-                                    "labSectionId": child_section.get("sectionId"),
-                                    "labCourseCode": child_section.get("courseCode"),
-                                    "labFaculties": child_section.get("faculties"),
-                                    "labName": child_section.get("sectionName"),
-                                    "labRoomName": child_section.get("roomName"),
-                                    "labSchedules": lab_schedule
-                                }
-                                updated_lab_data.append(lab_info)
-                                
-                                # Update the section in the original list using the lookup dictionary
-                                if section_id in section_dict:
-                                    sections[section_dict[section_id]].update(lab_info)
-                                
-                                # Update the lab cache
-                                lab_cache[section_id] = lab_info
-                    except Exception as e:
-                        logger.error(f"Error processing section details for section {section_id}: {str(e)}")
-                        continue
+                    # Use shield to prevent cancellation during request
+                    resp = await asyncio.shield(client.get(url, headers=headers, timeout=10.0))
+                    
+                    if resp.status_code == 200:
+                        details_data = resp.json()
+                        child_section = details_data.get("childSection")
+                        if child_section:
+                            lab_info = {
+                                "sectionId": section_id,
+                                "labSectionId": child_section.get("sectionId"),
+                                "labCourseCode": child_section.get("courseCode"),
+                                "labFaculties": child_section.get("faculties"),
+                                "labName": child_section.get("sectionName"),
+                                "labRoomName": child_section.get("roomName"),
+                                "labSchedules": child_section.get("sectionSchedule")
+                            }
+                            updated_lab_data.append(lab_info)
+                            # Update the section in the original list
+                            for idx, orig_section in enumerate(sections):
+                                if str(orig_section.get("sectionId")) == str(section_id):
+                                    sections[idx].update(lab_info)
+                                    break
+                            # Update the lab cache
+                            lab_cache[str(section_id)] = lab_info
+                except Exception as e:
+                    logger.error(f"Error fetching section details for section {section_id}: {str(e)}")
+                    continue
     
-        # Update Redis with any new lab sections found and deduplicate
+        # Update Redis with any new lab sections found
         if updated_lab_data:
             try:
-                # Deduplicate cache before saving
-                final_count = deduplicate_lab_cache_sync()
-                logger.info(f"Lab cache deduplicated to {final_count} unique lab sections")
-                
                 # Save updated lab cache to Redis
-                save_lab_cache_to_redis_sync(lab_cache)
+                await save_lab_cache_to_redis(lab_cache)
                 logger.info(f"Updated Redis lab cache with {len(updated_lab_data)} new lab sections")
             except Exception as e:
                 logger.error(f"Error updating Redis lab cache: {str(e)}")
     else:
         logger.info("No new sections to check for labs in current schedule")
     
-    # Apply cached lab data to all sections in the list using the lookup dictionary
-    for section_id, lab_data in lab_cache.items():
-        if section_id in section_dict:
-            sections[section_dict[section_id]].update(lab_data)
+    # Apply cached lab data to all sections in the list
+    for section in sections:
+        section_id = str(section.get("sectionId"))
+        if section_id in lab_cache:
+            section.update(lab_cache[section_id])
     
     return sections
-
-async def update_lab_cache(token: str, sections: list):
-    """Async wrapper for update_lab_cache_sync."""
-    return update_lab_cache_sync(token, sections)
 
 @asynccontextmanager
 async def get_schedule_lock():
@@ -1703,171 +1108,150 @@ async def get_schedule_lock():
         if not schedule_locks[loop].locked() and loop in schedule_locks:
             del schedule_locks[loop]
 
-# Removed caching for raw schedule to ensure real-time data
-
 @app.get("/raw-schedule", response_class=JSONResponse)
-def raw_schedule(request: Request):
+async def raw_schedule(request: Request):
     """Get the raw schedule data. Public endpoint using most recent valid token or latest cached schedule."""
     try:
-        session_id = request.session.get("id")
-        # Try to get a valid token
-        if session_id:
-            tokens = _load_tokens_from_redis_sync(session_id)
-            if tokens and "access_token" in tokens and not is_token_expired(tokens):
-                token = tokens["access_token"]
+        async with get_schedule_lock():  # Use the new lock manager
+            session_id = request.session.get("id")
+            # Try to get a valid token
+            if session_id:
+                tokens = await load_tokens_from_redis(session_id)
+                if tokens and "access_token" in tokens and not is_token_expired(tokens):
+                    token = tokens["access_token"]
+                else:
+                    token = await get_latest_valid_token()
             else:
-                token = get_latest_valid_token_sync()
-        else:
-            token = get_latest_valid_token_sync()
+                token = await get_latest_valid_token()
 
-        redis_conn = get_redis_sync()
+            redis_conn = await get_redis()
 
-        if not token:
-            keys = redis_conn.keys("student_schedule:*")
-            if keys:
-                latest_key = sorted(keys)[-1]
-                cached_schedule = redis_conn.get(latest_key)
-                if cached_schedule:
-                    schedule_data = json.loads(cached_schedule)
-                    # Ensure sectionSchedule is parsed from string if needed
-                    for section in schedule_data:
-                        for schedule_field in ["sectionSchedule", "labSchedules"]:
-                            if isinstance(section.get(schedule_field), str):
-                                try:
-                                    section[schedule_field] = json.loads(section[schedule_field])
-                                except:
-                                    section[schedule_field] = None
-                    
-                    response_data = {
-                        "cached": True,
-                        "data": schedule_data
-                    }
-                    
-                    return JSONResponse(response_data)
-            return JSONResponse({"error": "No valid token or cached schedule available"}, status_code=503)
+            if not token:
+                keys = await redis_conn.keys("student_schedule:*")
+                if keys:
+                    latest_key = sorted(keys)[-1]
+                    cached_schedule = await redis_conn.get(latest_key)
+                    if cached_schedule:
+                        schedule_data = json.loads(cached_schedule)
+                        # Ensure sectionSchedule is parsed from string if needed
+                        for section in schedule_data:
+                            for schedule_field in ["sectionSchedule", "labSchedules"]:
+                                if isinstance(section.get(schedule_field), str):
+                                    try:
+                                        section[schedule_field] = json.loads(section[schedule_field])
+                                    except:
+                                        section[schedule_field] = None
+                        return JSONResponse({
+                            "cached": True,
+                            "data": schedule_data
+                        })
+                return JSONResponse({"error": "No valid token or cached schedule available"}, status_code=503)
 
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "Mozilla/5.0",
-            "Origin": "https://connect.bracu.ac.bd",
-            "Referer": "https://connect.bracu.ac.bd/"
-        }
-        
-        # Get student ID and schedule using synchronous client
-        with httpx.Client(timeout=15.0) as client:
-            # Get student ID
-            portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
-            
-            resp = client.get(portfolios_url, headers=headers)
-            
-            if resp.status_code == 401:
-                logger.warning("Token unauthorized")
-                if session_id:
-                    redis_conn.delete(f"tokens:{session_id}")
-                return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
-            
-            if resp.status_code != 200:
-                return JSONResponse({
-                    "error": "Failed to fetch student info", 
-                    "status_code": resp.status_code
-                }, status_code=resp.status_code)
-            
-            data = resp.json()
-            if not isinstance(data, list) or not data or "id" not in data[0]:
-                return JSONResponse({"error": "Could not find student id in response."}, status_code=500)
-            
-            student_id = data[0]["id"]
-            logger.info(f"Got student ID: {student_id}")
-
-            # Check if we have a cached schedule for this student
-            cached_schedule = _load_student_schedule_sync(student_id)
-            if cached_schedule:
-                # Use cached schedule as a fallback if API call fails
-                fallback_schedule = cached_schedule
-            else:
-                fallback_schedule = None
-
-            # Get schedule and seat status sequentially
-            schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
-            seat_status_url = "https://connect.bracu.ac.bd/api/adv/v1/advising/sections/seat-status"
-            
-            schedule_resp = client.get(schedule_url, headers=headers)
-            seat_status_resp = client.get(seat_status_url, headers=headers)
-            
-            # Handle schedule response
-            if schedule_resp.status_code != 200:
-                if schedule_resp.status_code == 401:
-                    logger.warning("Token unauthorized")
-                    if session_id:
-                        redis_conn.delete(f"tokens:{session_id}")
-                    return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
-                
-                if fallback_schedule:
-                    response_data = {
-                        "cached": True,
-                        "data": fallback_schedule
-                    }
-                    return JSONResponse(response_data)
-                return JSONResponse({
-                    "error": "Failed to fetch schedule",
-                    "status_code": schedule_resp.status_code
-                }, status_code=schedule_resp.status_code)
-            
-            schedule_data = schedule_resp.json()
-            
-            # Process seat status response
-            booked_seats = {}
-            if seat_status_resp.status_code == 200:
-                try:
-                    booked_seats = seat_status_resp.json()
-                except Exception as e:
-                    logger.error(f"Error parsing seat status: {str(e)}")
-            
-            # Ensure lab_cache is loaded
-            global lab_cache
-            if not lab_cache:
-                lab_cache = load_lab_cache_from_redis_sync() or {}
-                logger.info(f"Loaded {len(lab_cache)} lab sections from Redis cache")
-            
-            # Create a lookup dictionary for faster section access
-            section_dict = {str(section.get("sectionId")): idx for idx, section in enumerate(schedule_data) if section.get("sectionId")}
-            
-            # Apply cached lab data to schedule sections using the lookup dictionary
-            for section_id, lab_data in lab_cache.items():
-                if section_id in section_dict:
-                    schedule_data[section_dict[section_id]].update(lab_data)
-            
-            # Update seat status and parse schedules
-            for section in schedule_data:
-                section_id = str(section.get("sectionId"))
-                total_capacity = section.get("capacity", 0)
-                current_booked = booked_seats.get(section_id, section.get("consumedSeat", 0))
-                
-                section["consumedSeat"] = current_booked
-                section["realTimeSeatCount"] = max(0, total_capacity - current_booked)
-                
-                # Parse schedules and ensure they are JSON objects before caching
-                for schedule_field in ["sectionSchedule", "labSchedules"]:
-                    schedule_value = section.get(schedule_field)
-                    if isinstance(schedule_value, str):
-                        try:
-                            section[schedule_field] = json.loads(schedule_value)
-                        except:
-                            section[schedule_field] = None
-                    elif schedule_value is None:
-                        section[schedule_field] = None
-            
-            # Cache the schedule with parsed JSON objects
-            _save_student_schedule_sync(student_id, schedule_data)
-            
-            response_data = {
-                "cached": False,
-                "data": schedule_data
+            headers = {
+                "Accept": "application/json",
+                "Authorization": f"Bearer {token}",
+                "User-Agent": "Mozilla/5.0",
+                "Origin": "https://connect.bracu.ac.bd",
+                "Referer": "https://connect.bracu.ac.bd/"
             }
             
-            return JSONResponse(response_data)
+            # Get student ID and schedule in one go
+            async with httpx.AsyncClient() as client:
+                # Get student ID
+                portfolios_url = "https://connect.bracu.ac.bd/api/mds/v1/portfolios"
+                resp = await client.get(portfolios_url, headers=headers)
+                if resp.status_code == 401:
+                    logger.warning("Token unauthorized")
+                    if session_id:
+                        await redis_conn.delete(f"tokens:{session_id}")
+                    return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
                 
+                if resp.status_code != 200:
+                    return JSONResponse({
+                        "error": "Failed to fetch student info", 
+                        "status_code": resp.status_code
+                    }, status_code=resp.status_code)
+                
+                data = resp.json()
+                if not isinstance(data, list) or not data or "id" not in data[0]:
+                    return JSONResponse({"error": "Could not find student id in response."}, status_code=500)
+                
+                student_id = data[0]["id"]
+                logger.info(f"Got student ID: {student_id}")
+
+                # Get schedule
+                schedule_url = f"https://connect.bracu.ac.bd/api/adv/v1/advising/sections/student/{student_id}/schedules"
+                resp = await client.get(schedule_url, headers=headers)
+                
+                if resp.status_code == 200:
+                    schedule_data = resp.json()
+                    
+                    # Get real-time seat status
+                    booked_seats = await get_seat_status(token)
+                    
+                    # Ensure lab_cache is loaded
+                    global lab_cache
+                    if not lab_cache:
+                        lab_cache = await load_lab_cache_from_redis() or {}
+                        logger.info(f"Loaded {len(lab_cache)} lab sections from Redis cache")
+                    
+                    # Apply cached lab data to schedule sections
+                    for section in schedule_data:
+                        section_id = str(section.get("sectionId"))
+                        if section_id in lab_cache:
+                            section.update(lab_cache[section_id])
+                    
+                    # Update seat status and parse schedules
+                    for section in schedule_data:
+                        section_id = str(section.get("sectionId"))
+                        total_capacity = section.get("capacity", 0)
+                        current_booked = booked_seats.get(section_id, section.get("consumedSeat", 0))
+                        
+                        section["consumedSeat"] = current_booked
+                        section["realTimeSeatCount"] = max(0, total_capacity - current_booked)
+                        
+                        # Parse schedules and ensure they are JSON objects before caching
+                        for schedule_field in ["sectionSchedule", "labSchedules"]:
+                            schedule_value = section.get(schedule_field)
+                            if isinstance(schedule_value, str):
+                                try:
+                                    section[schedule_field] = json.loads(schedule_value)
+                                except:
+                                    section[schedule_field] = None
+                            elif schedule_value is None:
+                                section[schedule_field] = None
+                    
+                    # Cache the schedule with parsed JSON objects
+                    await save_student_schedule(student_id, schedule_data)
+                    return JSONResponse({
+                        "cached": False,
+                        "data": schedule_data
+                    })
+                elif resp.status_code == 401:
+                    logger.warning("Token unauthorized")
+                    if session_id:
+                        await redis_conn.delete(f"tokens:{session_id}")
+                    return JSONResponse({"error": "Token expired, please refresh page"}, status_code=401)
+                else:
+                    cached_schedule = await load_student_schedule(student_id)
+                    if cached_schedule:
+                        # Ensure sectionSchedule is parsed from string if needed
+                        for section in cached_schedule:
+                            for schedule_field in ["sectionSchedule", "labSchedules"]:
+                                if isinstance(section.get(schedule_field), str):
+                                    try:
+                                        section[schedule_field] = json.loads(section[schedule_field])
+                                    except:
+                                        section[schedule_field] = None
+                        return JSONResponse({
+                            "cached": True,
+                            "data": cached_schedule
+                        })
+                    return JSONResponse({
+                        "error": "Failed to fetch schedule",
+                        "status_code": resp.status_code
+                    }, status_code=resp.status_code)
+                    
     except Exception as e:
         logger.error(f"Error in raw_schedule: {str(e)}")
         return JSONResponse({
@@ -1886,42 +1270,36 @@ async def global_exception_handler(request: Request, exc: Exception):
         logger.error(traceback.format_exc())
         trace_print(f"Full stack trace for error {error_id}:\n{traceback.format_exc()}")
     
-    error_response = ErrorResponse(
-        error="Internal server error",
-        error_code=f"UNHANDLED_ERROR_{error_id}",
-        details={
-            "message": str(exc),
-            "stack_trace": traceback.format_exc() if DEBUG_MODE else None,
-            "error_id": error_id
-        } if DEBUG_MODE or TRACE_MODE else {"error_id": error_id}
-    )
-    
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content=error_response.dict()
+        content=ErrorResponse(
+            error="Internal server error",
+            error_code=f"UNHANDLED_ERROR_{error_id}",
+            details={
+                "message": str(exc),
+                "stack_trace": traceback.format_exc() if DEBUG_MODE else None,
+                "error_id": error_id
+            } if DEBUG_MODE or TRACE_MODE else {"error_id": error_id}
+        ).dict()
     )
 
-def check_section_changes_sync(sections: list) -> Tuple[bool, int, int]:
-    """Check if the total number of sections has changed synchronously."""
+async def check_section_changes(sections: list) -> Tuple[bool, int, int]:
+    """Check if the total number of sections has changed."""
     try:
         current_count = len(sections)
-        stored_count = get_section_count_from_redis_sync() or 0
+        stored_count = await get_section_count_from_redis() or 0
         
         # Only update stored count if we have sections
         if current_count > 0:
             has_changed = current_count != stored_count
             if has_changed:
                 logger.info(f"Section count changed: {stored_count} -> {current_count}")
-                save_section_count_to_redis_sync(current_count)
+                await save_section_count_to_redis(current_count)
             return has_changed, current_count, stored_count
         return False, stored_count, stored_count
     except Exception as e:
         logger.error(f"Error checking section changes: {str(e)}")
         return False, 0, 0
-
-async def check_section_changes(sections: list) -> Tuple[bool, int, int]:
-    """Async wrapper for check_section_changes_sync."""
-    return check_section_changes_sync(sections)
 
 @asynccontextmanager
 async def get_task_lock(task_id: str):
@@ -2199,14 +1577,6 @@ async def update_all_labs_background(token: str, sections: list, task_id: str):
                                 details_data = resp.json()
                                 child_section = details_data.get("childSection")
                                 if child_section:
-                                    # Parse sectionSchedule if it's a string
-                                    lab_schedule = child_section.get("sectionSchedule")
-                                    if isinstance(lab_schedule, str):
-                                        try:
-                                            lab_schedule = json.loads(lab_schedule)
-                                        except:
-                                            lab_schedule = None
-                                    
                                     lab_info = {
                                         "sectionId": section_id,
                                         "labSectionId": child_section.get("sectionId"),
@@ -2214,7 +1584,7 @@ async def update_all_labs_background(token: str, sections: list, task_id: str):
                                         "labFaculties": child_section.get("faculties"),
                                         "labName": child_section.get("sectionName"),
                                         "labRoomName": child_section.get("roomName"),
-                                        "labSchedules": lab_schedule
+                                        "labSchedules": child_section.get("sectionSchedule")
                                     }
                                     lab_cache[str(section_id)] = lab_info
                                     new_labs += 1
@@ -2259,10 +1629,8 @@ async def update_all_labs_background(token: str, sections: list, task_id: str):
                     # Small delay between sections
                     await asyncio.sleep(0.2)
                 
-                # Save final results to Redis and deduplicate
+                # Save final results to Redis
                 if new_labs > 0:
-                    final_count = await deduplicate_lab_cache()
-                    logger.info(f"Lab cache deduplicated to {final_count} unique lab sections")
                     await save_lab_cache_to_redis(lab_cache)
                     debug_print(f"Added {new_labs} new lab sections to Redis cache")
                 
@@ -2326,221 +1694,6 @@ async def shutdown_event():
     BACKGROUND_TASKS.clear()
     TASK_LOCKS.clear()
 
-async def validate_token_live(access_token: str) -> dict:
-    """Validate token by calling the BRACU Connect API portfolios endpoint."""
-    try:
-        headers = {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent": "Mozilla/5.0",
-            "Origin": "https://connect.bracu.ac.bd",
-            "Referer": "https://connect.bracu.ac.bd/"
-        }
-        
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://connect.bracu.ac.bd/api/mds/v1/portfolios",
-                headers=headers,
-                timeout=10.0
-            )
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if data and len(data) > 0 and "id" in data[0]:
-                    return {
-                        "valid": True,
-                        "student_id": data[0].get("studentId"),
-                        "full_name": data[0].get("fullName"),
-                        "portfolio_id": data[0].get("id"),
-                        "timestamp": int(time.time())
-                    }
-                else:
-                    return {"valid": False, "error": "Invalid response format"}
-            elif resp.status_code == 401:
-                return {"valid": False, "error": "Token expired or invalid"}
-            else:
-                return {"valid": False, "error": f"HTTP {resp.status_code}"}
-                
-    except Exception as e:
-        logger.error(f"Token validation error: {str(e)}")
-        return {"valid": False, "error": str(e)}
-
-@app.get("/token-status")
-async def get_token_status(request: Request):
-    """Get current token status with live validation."""
-    session_id = request.session.get("id")
-    if not session_id:
-        session_id = secrets.token_urlsafe(16)
-        request.session["id"] = session_id
-        return {"valid": False, "error": "No session"}
-    
-    tokens = await load_tokens_from_redis(session_id)
-    if not tokens or not tokens.get("access_token"):
-        return {"valid": False, "error": "No tokens found"}
-    
-    # Validate token live
-    validation_result = await validate_token_live(tokens["access_token"])
-    
-    # Update cache with validation timestamp
-    if validation_result["valid"]:
-        tokens["last_validation"] = validation_result["timestamp"]
-        await save_tokens_to_redis(session_id, tokens)
-    
-    return validation_result
-
-@app.get("/token-status/continuous")
-async def continuous_token_check(request: Request):
-    """Continuous token validation endpoint for real-time updates."""
-    session_id = request.session.get("id")
-    if not session_id:
-        session_id = secrets.token_urlsafe(16)
-        request.session["id"] = session_id
-        return {"valid": False, "error": "No session"}
-    
-    tokens = await load_tokens_from_redis(session_id)
-    if not tokens or not tokens.get("access_token"):
-        return {"valid": False, "error": "No tokens found"}
-    
-    validation_result = await validate_token_live(tokens["access_token"])
-    return validation_result
-
-@app.get("/global-token-status")
-async def get_global_token_status():
-    """Get global token status - shows if any valid tokens exist in Redis without exposing actual tokens."""
-    try:
-        redis_conn = get_redis_sync()
-        
-        # Get all token keys
-        token_keys = redis_conn.keys("tokens:*")
-        if not token_keys:
-            return {
-                "has_active_tokens": False,
-                "message": "No tokens found in Redis",
-                "total_sessions": 0,
-                "active_sessions": 0,
-                "last_updated": int(time.time())
-            }
-        
-        total_sessions = len(token_keys)
-        active_sessions = 0
-        earliest_expiry = None
-        latest_expiry = None
-        
-        # Check each token for validity
-        for key in token_keys:
-            try:
-                tokens_str = redis_conn.get(key)
-                if tokens_str:
-                    tokens = json.loads(tokens_str)
-                    if tokens and "access_token" in tokens:
-                        # Check if token is valid and not expired
-                        if not is_token_expired(tokens):
-                            active_sessions += 1
-                            
-                            # Track expiry times
-                            if "expires_at" in tokens:
-                                expiry = tokens["expires_at"]
-                                if earliest_expiry is None or expiry < earliest_expiry:
-                                    earliest_expiry = expiry
-                                if latest_expiry is None or expiry > latest_expiry:
-                                    latest_expiry = expiry
-            except (json.JSONDecodeError, Exception):
-                continue
-        
-        has_active_tokens = active_sessions > 0
-        
-        # Calculate uptime and remaining time
-        uptime_seconds = None
-        uptime_display = None
-        remaining_display = None
-        
-        # Find the earliest created active token for uptime calculation
-        earliest_created = None
-        if has_active_tokens:
-            for key in token_keys:
-                try:
-                    tokens_str = redis_conn.get(key)
-                    if tokens_str:
-                        tokens = json.loads(tokens_str)
-                        if tokens and "access_token" in tokens and not is_token_expired(tokens):
-                            created_at = tokens.get("activated_at", tokens.get("created_at"))
-                            if created_at is None:
-                                # Fallback to current time if no creation timestamp
-                                created_at = int(time.time())
-                            if earliest_created is None or created_at < earliest_created:
-                                earliest_created = created_at
-                except:
-                    continue
-        
-        if earliest_created:
-            now = int(time.time())
-            uptime_seconds = max(0, now - earliest_created)
-            
-            # Format uptime display
-            uptime_parts = []
-            if uptime_seconds >= 86400:
-                days = uptime_seconds // 86400
-                uptime_parts.append(f"{days}d")
-                hours = (uptime_seconds % 86400) // 3600
-                if hours > 0:
-                    uptime_parts.append(f"{hours}h")
-            elif uptime_seconds >= 3600:
-                hours = uptime_seconds // 3600
-                uptime_parts.append(f"{hours}h")
-                minutes = (uptime_seconds % 3600) // 60
-                if minutes > 0:
-                    uptime_parts.append(f"{minutes}m")
-            else:
-                minutes = uptime_seconds // 60
-                if minutes > 0:
-                    uptime_parts.append(f"{minutes}m")
-                seconds = uptime_seconds % 60
-                uptime_parts.append(f"{seconds}s")
-            
-            uptime_display = " ".join(uptime_parts)
-        
-        if earliest_expiry:
-            now = int(time.time())
-            remaining = max(0, earliest_expiry - now)
-            if remaining > 0:
-                days, remainder = divmod(remaining, 86400)
-                hours, remainder = divmod(remainder, 3600)
-                minutes, seconds = divmod(remainder, 60)
-                
-                parts = []
-                if days:
-                    parts.append(f"{days}d")
-                if hours:
-                    parts.append(f"{hours}h")
-                if minutes:
-                    parts.append(f"{minutes}m")
-                if seconds or not parts:
-                    parts.append(f"{seconds}s")
-                
-                remaining_display = " ".join(parts)
-        
-        return {
-            "has_active_tokens": has_active_tokens,
-            "message": f"{active_sessions} active tokens found across {total_sessions} sessions" if has_active_tokens else "No active tokens found",
-            "total_sessions": total_sessions,
-            "active_sessions": active_sessions,
-            "earliest_token_expires": earliest_expiry,
-            "latest_token_expires": latest_expiry,
-            "uptime_seconds": uptime_seconds,
-            "uptime_display": uptime_display,
-            "remaining_time_display": remaining_display,
-            "last_updated": int(time.time())
-        }
-        
-    except Exception as e:
-        logger.error(f"Error checking global token status: {str(e)}")
-        return {
-            "has_active_tokens": False,
-            "message": "Error checking token status",
-            "error": str(e),
-            "last_updated": int(time.time())
-        }
-
 @app.get("/update-labs/status/{task_id}", response_class=JSONResponse)
 async def get_update_status(task_id: str):
     """Get the status of a background lab update task."""
@@ -2566,5 +1719,3 @@ async def get_update_status(task_id: str):
         task_info["cleanup_in"] = remaining
     
     return JSONResponse(task_info)
-
-# Vercel handler for serverless deployment
