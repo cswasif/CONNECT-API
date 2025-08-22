@@ -299,22 +299,32 @@ def _save_tokens_to_redis_sync(session_id, tokens):
                 tokens["expires_at"] = jwt_data["exp"]
                 tokens["expires_in"] = max(0, jwt_data["exp"] - now)
                 debug_print(f"Token expiration from JWT: {tokens['expires_in']} seconds remaining")
+            elif "expires_in" in tokens:
+                # Use the actual expires_in from SSO response
+                tokens["expires_at"] = now + int(tokens["expires_in"])
+                debug_print(f"Token expiration from SSO: {tokens['expires_in']} seconds")
             else:
-                # Increased default expiration to 10 minutes
-                tokens["expires_at"] = now + 600
-                tokens["expires_in"] = 600
-                logger.warning("No expiration found in JWT, using default 10 minutes")
+                # Default to 5 minutes based on actual token data
+                tokens["expires_at"] = now + 300
+                tokens["expires_in"] = 300
+                logger.warning("No expiration found, using default 5 minutes")
         
-        # Always set refresh token expiration to 60 minutes from now if we have a refresh token
+        # Set refresh token expiration from SSO response or default to 30 minutes
         if "refresh_token" in tokens:
-            tokens["refresh_expires_at"] = now + (60 * 60)  # 60 minutes
+            if "refresh_expires_in" in tokens:
+                tokens["refresh_expires_at"] = now + int(tokens["refresh_expires_in"])
+                debug_print(f"Refresh token expiration from SSO: {tokens['refresh_expires_in']} seconds")
+            else:
+                tokens["refresh_expires_at"] = now + (30 * 60)  # 30 minutes based on actual data
+                debug_print("Refresh token expiration set to 30 minutes")
         
         # Save tokens with expiration
         key = f"tokens:{session_id}"
         redis_conn.set(key, json.dumps(tokens))
         
         # Set key expiration to match the refresh token expiration
-        redis_conn.expire(key, 60 * 60)  # 60 minutes
+        refresh_expires_in = tokens.get("refresh_expires_in", 30 * 60)
+        redis_conn.expire(key, int(refresh_expires_in))  # Use actual refresh token lifetime
         
         debug_print(f"Tokens saved in Redis for session {session_id}. Access token expires in {tokens.get('expires_in', 0)}s")
         return True
@@ -347,14 +357,14 @@ def _load_tokens_from_redis_sync(session_id):
             tokens = json.loads(data)
             now = int(time.time())
             
-            # Check if token needs proactive refresh (75% through its lifetime)
+            # Check if token needs proactive refresh (50% through its lifetime for 5-min tokens)
             needs_refresh = False
             if "expires_at" in tokens and "refresh_token" in tokens:
-                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                if time_elapsed >= (total_lifetime * 0.75):
+                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 300))
+                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 300))
+                if time_elapsed >= (total_lifetime * 0.5):  # Refresh at 50% for 5-min tokens
                     needs_refresh = True
-                    debug_print(f"Token needs proactive refresh for session {session_id} (75% lifetime elapsed)")
+                    debug_print(f"Token needs proactive refresh for session {session_id} (50% lifetime elapsed)")
             
             # If token is not expired and doesn't need proactive refresh
             if not is_token_expired(tokens) and not needs_refresh:
@@ -669,7 +679,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         logger.error(f"Error refreshing token: {str(e)}")
         return None
 
-def is_token_expired(tokens, buffer=600):  # Increased buffer to 10 minutes
+def is_token_expired(tokens, buffer=30):  # Reduced buffer for 5-min access tokens
     """Check if tokens are expired with a buffer time."""
     if not tokens:
         return True
@@ -764,11 +774,11 @@ async def get_latest_valid_token():
                             # Check if token needs proactive refresh
                             needs_refresh = is_token_expired(tokens)
                             if not needs_refresh and "refresh_token" in tokens:
-                                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 600))
-                                if time_elapsed >= (total_lifetime * 0.75):
+                                total_lifetime = tokens["expires_at"] - (tokens.get("activated_at") or (tokens["expires_at"] - 300))
+                                time_elapsed = now - (tokens.get("activated_at") or (tokens["expires_at"] - 300))
+                                if time_elapsed >= (total_lifetime * 0.5):  # Refresh at 50% for 5-min tokens
                                     needs_refresh = True
-                                    debug_print(f"Latest token needs proactive refresh (75% lifetime elapsed)")
+                                    debug_print(f"Latest token needs proactive refresh (50% lifetime elapsed)")
                 except json.JSONDecodeError:
                     continue
         
