@@ -166,7 +166,7 @@ async def toggle_debug(mode: str = Query(..., regex="^(debug|trace)$")):
 # Session initialization will be handled by the root endpoint and token endpoints
 
 # Upstash Redis config
-REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:@willing-husky-43244.upstash.io:6379"
+REDIS_URL = os.environ.get("REDIS_URL") or "rediss://default:AajsAAIncDFjY2Q4YWQzMjYwODY0ZWJkYTZjYzYyNGNhNjUwODkzZHAxNDMyNDQ@willing-husky-43244.upstash.io:6379"
 
 # Redis client instance cache to avoid creating new connections repeatedly
 _redis_client_cache = None
