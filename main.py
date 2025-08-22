@@ -1662,15 +1662,32 @@ def update_lab_cache_sync(token: str, sections: list):
                                     except:
                                         lab_schedule = None
                                 
+                                # Ensure we properly identify lab sections
+                                course_code = child_section.get("courseCode", "")
+                                section_name = child_section.get("sectionName", "")
+                                
+                                # Check if this is a lab section by course code suffix or name
+                                is_lab = (
+                                    course_code.upper().endswith("L") or
+                                    "LAB" in section_name.upper() or
+                                    "LABORATORY" in section_name.upper()
+                                )
+                                
                                 lab_info = {
                                     "sectionId": section_id,
                                     "labSectionId": child_section.get("sectionId"),
-                                    "labCourseCode": child_section.get("courseCode"),
+                                    "labCourseCode": course_code,
                                     "labFaculties": child_section.get("faculties"),
-                                    "labName": child_section.get("sectionName"),
+                                    "labName": section_name,
                                     "labRoomName": child_section.get("roomName"),
-                                    "labSchedules": lab_schedule
+                                    "labSchedules": lab_schedule,
+                                    "isLab": is_lab
                                 }
+                                
+                                # Log MAT120 lab detection
+                                if "MAT120" in course_code.upper():
+                                    logger.info(f"Found MAT120 lab section: {course_code} - {section_name} (isLab: {is_lab})")
+                                
                                 updated_lab_data.append(lab_info)
                                 
                                 # Update the section in the original list using the lookup dictionary
