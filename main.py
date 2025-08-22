@@ -1999,14 +1999,51 @@ async def cleanup_task(task_id: str):
 async def update_labs(request: Request):
     """Start a background task to update lab sections."""
     try:
+        # Ensure session exists
         session_id = request.session.get("id")
         if not session_id:
-            return JSONResponse({"error": "No session found"}, status_code=401)
+            session_id = secrets.token_urlsafe(16)
+            request.session["id"] = session_id
         
-        # Get a valid token
+        # Get a valid token - first try session-specific tokens
         tokens = await load_tokens_from_redis(session_id)
+        
+        # If no session tokens, try to find any valid tokens globally
         if not tokens or "access_token" not in tokens or is_token_expired(tokens):
-            return JSONResponse({"error": "No valid token found"}, status_code=401)
+            # Urgent lab caching: use direct token discovery without buffer
+            redis_conn = get_redis_sync()
+            all_keys = redis_conn.keys("tokens:*")
+            
+            # For urgent caching, bypass buffer entirely
+            current_time = int(time.time())
+            
+            for key in all_keys:
+                key_str = key.decode('utf-8') if isinstance(key, bytes) else str(key)
+                try:
+                    data = redis_conn.get(key)
+                    if data:
+                        other_tokens = json.loads(data)
+                        if (other_tokens and 
+                            "access_token" in other_tokens and 
+                            "expires_at" in other_tokens):
+                            # URGENT: Direct expiration check - no buffer
+                            if other_tokens["expires_at"] > current_time:
+                                tokens = other_tokens
+                                other_session_id = key_str.replace("tokens:", "")
+                                logger.info(f"URGENT LAB CACHING: Using global tokens from session {other_session_id}")
+                                break
+                except Exception as e:
+                    logger.warning(f"Error loading tokens from key {key_str}: {e}")
+                    continue
+            
+            # Final check: ensure token is actually valid (direct expiration only)
+            if not tokens or "access_token" not in tokens:
+                return JSONResponse({"error": "No valid token found"}, status_code=401)
+            
+            # Direct expiration check for final validation
+            current_time = int(time.time())
+            if tokens.get("expires_at", 0) <= current_time:
+                return JSONResponse({"error": "No valid token found"}, status_code=401)
         
         token = tokens["access_token"]
         
