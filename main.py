@@ -669,7 +669,7 @@ async def refresh_access_token(refresh_token: str) -> dict:
         logger.error(f"Error refreshing token: {str(e)}")
         return None
 
-def is_token_expired(tokens, buffer=300):  # Increased buffer to 5 minutes
+def is_token_expired(tokens, buffer=600):  # Increased buffer to 10 minutes
     """Check if tokens are expired with a buffer time."""
     if not tokens:
         return True
@@ -677,7 +677,15 @@ def is_token_expired(tokens, buffer=300):  # Increased buffer to 5 minutes
     # Check access token expiration
     if "expires_at" in tokens:
         if now + buffer >= tokens["expires_at"]:
+            logger.info(f"Token expiring soon: expires at {tokens['expires_at']}, current time {now}, buffer {buffer}s")
             return True
+    
+    # Also check refresh token expiration
+    if "refresh_expires_at" in tokens:
+        if now >= tokens["refresh_expires_at"]:
+            logger.info(f"Refresh token expired: expires at {tokens['refresh_expires_at']}, current time {now}")
+            return True
+    
     return False
 
 @with_redis_retry
@@ -780,10 +788,36 @@ async def get_latest_valid_token():
                     _save_tokens_to_redis_sync(session_id, new_tokens)
                     logger.info("Successfully refreshed token")
                     return new_tokens.get("access_token")
+                else:
+                    logger.error("Token refresh failed - invalid response")
+                    # Delete the expired/invalid tokens
+                    redis_conn.delete(f"tokens:{session_id}")
             except Exception as e:
                 logger.error(f"Error refreshing token: {str(e)}")
                 # Delete the expired/invalid tokens
                 redis_conn.delete(f"tokens:{session_id}")
+        
+        # Try to refresh other tokens even if the latest one failed
+        logger.info("Attempting to refresh other available tokens")
+        for key in token_keys:
+            try:
+                tokens_str = redis_conn.get(key)
+                if tokens_str:
+                    tokens = json.loads(tokens_str)
+                    if "refresh_token" in tokens:
+                        session_id = key.split(":")[-1]
+                        new_tokens = refresh_access_token_sync(tokens["refresh_token"])
+                        if new_tokens and "access_token" in new_tokens:
+                            new_tokens["activated_at"] = now
+                            _save_tokens_to_redis_sync(session_id, new_tokens)
+                            logger.info("Successfully refreshed token from backup session")
+                            return new_tokens.get("access_token")
+                        else:
+                            # Clean up failed refresh tokens
+                            redis_conn.delete(f"tokens:{session_id}")
+            except Exception as e:
+                logger.error(f"Error refreshing backup token: {str(e)}")
+                continue
         
         logger.warning("No valid tokens found and refresh attempts failed")
         return None
@@ -1707,22 +1741,36 @@ async def get_schedule_lock():
 
 @app.get("/raw-schedule", response_class=JSONResponse)
 def raw_schedule(request: Request):
-    """Get the raw schedule data. Public endpoint using most recent valid token or latest cached schedule."""
+    """Get the raw schedule data. Always attempts to fetch fresh data, only uses cached as last resort."""
     try:
         session_id = request.session.get("id")
-        # Try to get a valid token
-        if session_id:
-            tokens = _load_tokens_from_redis_sync(session_id)
-            if tokens and "access_token" in tokens and not is_token_expired(tokens):
-                token = tokens["access_token"]
+        
+        # First, try to get a valid token with aggressive refresh
+        token = None
+        attempts = 0
+        max_attempts = 3
+        
+        while attempts < max_attempts and not token:
+            attempts += 1
+            if session_id:
+                tokens = _load_tokens_from_redis_sync(session_id)
+                if tokens and "access_token" in tokens and not is_token_expired(tokens):
+                    token = tokens["access_token"]
+                    break
+                else:
+                    # Try to get global token with refresh
+                    token = asyncio.run(get_latest_valid_token())
             else:
-                token = get_latest_valid_token_sync()
-        else:
-            token = get_latest_valid_token_sync()
+                token = asyncio.run(get_latest_valid_token())
+            
+            if not token and attempts < max_attempts:
+                logger.info(f"Token refresh attempt {attempts}/{max_attempts} failed, retrying...")
+                time.sleep(1)  # Brief delay between attempts
 
         redis_conn = get_redis_sync()
 
         if not token:
+            # Only use cached data as absolute last resort
             keys = redis_conn.keys("student_schedule:*")
             if keys:
                 latest_key = sorted(keys)[-1]
@@ -1740,11 +1788,12 @@ def raw_schedule(request: Request):
                     
                     response_data = {
                         "cached": True,
-                        "data": schedule_data
+                        "data": schedule_data,
+                        "warning": "⚠️ No valid tokens available - serving cached data. This data may be outdated. Please add new tokens at /enter-tokens to get fresh schedule data."
                     }
                     
                     return JSONResponse(response_data)
-            return JSONResponse({"error": "No valid token or cached schedule available"}, status_code=503)
+            return JSONResponse({"error": "No valid tokens available. Please add tokens via /enter-tokens endpoint"}, status_code=401)
 
         headers = {
             "Accept": "application/json",
@@ -1806,7 +1855,8 @@ def raw_schedule(request: Request):
                 if fallback_schedule:
                     response_data = {
                         "cached": True,
-                        "data": fallback_schedule
+                        "data": fallback_schedule,
+                        "warning": "Failed to fetch fresh schedule. Using cached data which may be outdated."
                     }
                     return JSONResponse(response_data)
                 return JSONResponse({
