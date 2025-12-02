@@ -7,11 +7,11 @@ High-performance FastAPI backend for the RoutineZ application, deployed on Oracl
 ```mermaid
 graph LR
     User[User] -->|HTTPS| CF[Cloudflare Edge]
-    CF -->|Tunnel| Cloudflared[Cloudflared (VPS)]
+    CF -->|Tunnel| Cloudflared["Cloudflared (VPS)"]
     Cloudflared -->|HTTP| Nginx[Nginx Reverse Proxy]
-    Nginx -->|Proxy| Gunicorn[Gunicorn (2 Workers)]
+    Nginx -->|Proxy| Gunicorn["Gunicorn (2 Workers)"]
     Gunicorn -->|ASGI| FastAPI[FastAPI App]
-    FastAPI -->|Async| Redis[Local Redis (Cache/DB)]
+    FastAPI -->|Async| Redis["Local Redis (Cache/DB)"]
 ```
 
 ### Tech Stack
