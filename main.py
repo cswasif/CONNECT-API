@@ -1,6 +1,6 @@
 # =============================================================
 # ConnectAPI - BRACU Connect API Server
-# Developed by Wasif Faisal to support https://routinez.vercel.app/
+# Developed by Wasif Faisal to support https://routinez.app/
 # =============================================================
 
 from fastapi import FastAPI, Response, HTTPException, Header, Request, Cookie, status, Query, Form
