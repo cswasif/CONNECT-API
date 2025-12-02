@@ -1,0 +1,22 @@
+# Cloudflare Tunnel Configuration for ConnectAPI
+# Replace YOUR_TUNNEL_ID with your actual tunnel ID
+
+tunnel: YOUR_TUNNEL_ID
+credentials-file: /home/ubuntu/.cloudflared/YOUR_TUNNEL_ID.json
+
+# Ingress rules - order matters!
+ingress:
+  # Main API endpoint
+  - hostname: connect.routinez.app
+    service: http://localhost:80
+    originRequest:
+      noTLSVerify: false
+      connectTimeout: 30s
+      httpHostHeader: connect.routinez.app
+
+  # Catch-all rule (required)
+  - service: http_status:404
+
+# Optional: Logging
+# loglevel: info
+# logfile: /var/log/cloudflared/cloudflared.log

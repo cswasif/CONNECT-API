@@ -1,0 +1,35 @@
+[Unit]
+Description=ConnectAPI - BRACU Connect API Server
+After=network.target redis.service
+Wants=redis.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/zconnapi2-main
+Environment="PATH=/home/ubuntu/zconnapi2-main/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/home/ubuntu/zconnapi2-main/.env
+ExecStart=/home/ubuntu/zconnapi2-main/venv/bin/gunicorn -c gunicorn.conf.py main:app
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+Restart=always
+RestartSec=10
+
+# Create runtime directory for PID file
+RuntimeDirectory=connectapi
+RuntimeDirectoryMode=0755
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=connectapi
+
+[Install]
+WantedBy=multi-user.target
